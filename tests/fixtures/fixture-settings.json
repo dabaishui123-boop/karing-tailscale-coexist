@@ -1,0 +1,13 @@
+{
+  "tun": {
+    "enable": false,
+    "auto_route": false,
+    "hijack_dns": false,
+    "route_exclude_address": [
+      "127.0.0.0/8"
+    ]
+  },
+  "auto_connect_after_launch": false,
+  "auto_connect_at_boot": false,
+  "private_direct": false
+}

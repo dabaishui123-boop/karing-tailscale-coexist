@@ -1,0 +1,19 @@
+#!/bin/sh
+
+case "$1 $2" in
+  "status --json")
+    printf '%s\n' '{"BackendState":"Running","Self":{"Online":true,"DNSName":"windows-test.example-tail.ts.net."},"Peer":{}}'
+    ;;
+  "debug prefs")
+    printf '%s\n' '{"WantRunning":true,"CorpDNS":true,"RouteAll":false,"ExitNodeID":"","ExitNodeIP":"","AdvertiseRoutes":[]}'
+    ;;
+  "ip -4")
+    printf '%s\n' '100.100.100.101'
+    ;;
+  "set --help")
+    printf '%s\n' '--accept-dns --accept-routes --exit-node --advertise-exit-node --advertise-routes'
+    ;;
+  *)
+    exit 0
+    ;;
+esac

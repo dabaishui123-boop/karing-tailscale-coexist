@@ -63,3 +63,15 @@ MagicDNS 并没有被取消，而是通过 macOS `/etc/resolver/<tailnet-domain>
 
 管理员授权只用于写入或恢复 `/etc/resolver`。密码由 macOS `sudo` 在目标
 电脑本机读取，工具不会记录密码。
+
+## Windows 实现
+
+Windows 不使用 `/etc/resolver`。Tailscale 的 Windows 客户端通过系统
+DNS/NRPT 集成提供 MagicDNS，因此目标偏好为 `accept-dns=true`。Karing
+配置采用“保留现有 `route_exclude_address` 并追加必需 CIDR”的方式，避免
+覆盖 Windows 版已有的局域网和组播绕过项。
+
+Windows `configure` 的事务包含 Karing 设置、Tailscale 安全偏好、目标
+状态文件、运行脚本以及两个计划任务。登录任务负责启动恢复，周期任务只在
+隧道原本运行时纠偏；主动停止状态不会被覆盖。恢复操作前还会额外创建
+`pre-restore` 快照，恢复后公网检查失败时回到该保护快照。
