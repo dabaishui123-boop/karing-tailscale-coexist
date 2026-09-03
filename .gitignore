@@ -1,0 +1,13 @@
+.DS_Store
+*.log
+*.tmp
+*.bak
+backups/
+private/
+.env
+*.key
+*.pem
+*.mobileconfig
+karing_setting.json
+karing_subscribe*.json
+tailscale-*.json

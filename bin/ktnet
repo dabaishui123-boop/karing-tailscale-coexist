@@ -1,0 +1,819 @@
+#!/bin/bash
+
+# ktnet: keep Karing responsible for public traffic while Tailscale handles
+# Tailnet traffic and split MagicDNS on macOS.
+
+set -u
+set -o pipefail
+
+KTNET_VERSION="0.1.0"
+KARING_APP="${KTNET_KARING_APP:-/Applications/Karing.app}"
+TAILSCALE_APP="${KTNET_TAILSCALE_APP:-/Applications/Tailscale.app}"
+KARING_SETTINGS="${KTNET_KARING_SETTINGS:-${HOME}/Library/Group Containers/group.com.nebula.karing/karing_setting.json}"
+STATE_ROOT="${KTNET_STATE_ROOT:-${HOME}/.local/state/ktnet}"
+RUNTIME_DIR=""
+TAILSCALE_BIN=""
+FAILURES=0
+WARNINGS=0
+
+if [ -t 1 ]; then
+  C_GREEN='\033[32m'
+  C_YELLOW='\033[33m'
+  C_RED='\033[31m'
+  C_BLUE='\033[34m'
+  C_RESET='\033[0m'
+else
+  C_GREEN=''
+  C_YELLOW=''
+  C_RED=''
+  C_BLUE=''
+  C_RESET=''
+fi
+
+say() { printf '%b\n' "$*"; }
+info() { say "${C_BLUE}INFO${C_RESET}  $*"; }
+pass() { say "${C_GREEN}PASS${C_RESET}  $*"; }
+warn() { WARNINGS=$((WARNINGS + 1)); say "${C_YELLOW}WARN${C_RESET}  $*"; }
+fail() { FAILURES=$((FAILURES + 1)); say "${C_RED}FAIL${C_RESET}  $*"; }
+die() { say "${C_RED}ERROR${C_RESET} $*" >&2; exit 1; }
+
+cleanup() {
+  case "$RUNTIME_DIR" in
+    */ktnet.*)
+      if [ -d "$RUNTIME_DIR" ]; then
+        /bin/rm -rf -- "$RUNTIME_DIR"
+      fi
+      ;;
+  esac
+}
+trap cleanup EXIT HUP INT TERM
+
+make_runtime_dir() {
+  if [ -z "$RUNTIME_DIR" ]; then
+    RUNTIME_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ktnet.XXXXXX")" || die "无法创建临时目录"
+  fi
+}
+
+usage() {
+  cat <<'EOF'
+ktnet - Karing + Tailscale macOS 共存工具
+
+用法:
+  ktnet doctor
+  ktnet plan [配置选项]
+  ktnet configure [配置选项] [--yes] [--dry-run]
+  ktnet verify [--wait 秒]
+  ktnet backup
+  ktnet backups
+  ktnet restore <备份目录> [--yes]
+  ktnet open-downloads
+  ktnet version
+
+配置选项:
+  --tailnet-domain 域名   MagicDNS 域，例如 tail1234.ts.net；默认自动识别
+  --extra-route CIDR      需要 Karing 绕过的额外私网，可重复指定
+  --accept-routes         接受 Tailnet 广播的子网路由；默认关闭
+  --yes                   跳过 APPLY 文字确认
+  --dry-run               只构建并验证候选配置，不写入系统
+
+安全边界:
+  doctor、plan、verify 永远只读。
+  configure 会先备份，只修改 Karing 分流字段、Tailscale 路由/DNS偏好和
+  /etc/resolver/<tailnet-domain>，不会读取或复制订阅、节点、密钥和令牌。
+EOF
+}
+
+require_macos() {
+  [ "$(uname -s)" = "Darwin" ] || die "此工具只支持 macOS"
+}
+
+find_tailscale() {
+  if command -v tailscale >/dev/null 2>&1; then
+    TAILSCALE_BIN="$(command -v tailscale)"
+  elif [ -x "$TAILSCALE_APP/Contents/MacOS/Tailscale" ]; then
+    TAILSCALE_BIN="$TAILSCALE_APP/Contents/MacOS/Tailscale"
+  else
+    TAILSCALE_BIN=""
+  fi
+}
+
+json_raw() {
+  json_file="$1"
+  key_path="$2"
+  /usr/bin/plutil -extract "$key_path" raw -o - "$json_file" 2>/dev/null
+}
+
+json_type() {
+  json_file="$1"
+  key_path="$2"
+  /usr/bin/plutil -type "$key_path" "$json_file" 2>/dev/null
+}
+
+setting_raw() {
+  key_path="$1"
+  json_raw "$KARING_SETTINGS" "$key_path"
+}
+
+tailscale_status_file() {
+  make_runtime_dir
+  status_file="$RUNTIME_DIR/tailscale-status.json"
+  "$TAILSCALE_BIN" status --json >"$status_file" 2>/dev/null || return 1
+  printf '%s\n' "$status_file"
+}
+
+tailscale_prefs_file() {
+  make_runtime_dir
+  prefs_file="$RUNTIME_DIR/tailscale-prefs.json"
+  "$TAILSCALE_BIN" debug prefs >"$prefs_file" 2>/dev/null || return 1
+  printf '%s\n' "$prefs_file"
+}
+
+detect_tailnet_domain() {
+  [ -n "$TAILSCALE_BIN" ] || return 1
+  status_file="$(tailscale_status_file)" || return 1
+  dns_name="$(json_raw "$status_file" 'Self.DNSName')" || return 1
+  dns_name="${dns_name%.}"
+  case "$dns_name" in
+    *.*.ts.net) printf '%s\n' "${dns_name#*.}" ;;
+    *) return 1 ;;
+  esac
+}
+
+validate_domain() {
+  candidate="${1%.}"
+  case "$candidate" in
+    *.ts.net) ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$candidate" | grep -Eq '^[A-Za-z0-9-]+(\.[A-Za-z0-9-]+)*\.ts\.net$'
+}
+
+validate_cidr() {
+  printf '%s' "$1" | grep -Eq '^[0-9A-Fa-f:.]+/[0-9]{1,3}$'
+}
+
+route_interface() {
+  destination="$1"
+  route -n get "$destination" 2>/dev/null | awk '/interface:/{print $2; exit}'
+}
+
+route6_interface() {
+  destination="$1"
+  route -n get -inet6 "$destination" 2>/dev/null | awk '/interface:/{print $2; exit}'
+}
+
+karing_interface() {
+  ifconfig 2>/dev/null | awk '/^[a-z0-9]+:/{i=$1; sub(":","",i)} /inet 10\.20\.0\.1 /{print i; exit}'
+}
+
+tailscale_interface() {
+  [ -n "$TAILSCALE_BIN" ] || return 1
+  self_ip="$($TAILSCALE_BIN ip -4 2>/dev/null | head -1)"
+  [ -n "$self_ip" ] || return 1
+  ifconfig 2>/dev/null | awk -v ip="$self_ip" '/^[a-z0-9]+:/{i=$1; sub(":","",i)} $1=="inet" && $2==ip {print i; exit}'
+}
+
+first_online_peer_ip() {
+  [ -n "$TAILSCALE_BIN" ] || return 1
+  self_ip="$($TAILSCALE_BIN ip -4 2>/dev/null | head -1)"
+  "$TAILSCALE_BIN" status 2>/dev/null | awk -v self="$self_ip" '$1 ~ /^100\./ && $1 != self && $0 !~ /offline/ {print $1; exit}'
+}
+
+first_online_peer_name() {
+  [ -n "$TAILSCALE_BIN" ] || return 1
+  self_ip="$($TAILSCALE_BIN ip -4 2>/dev/null | head -1)"
+  "$TAILSCALE_BIN" status 2>/dev/null | awk -v self="$self_ip" '$1 ~ /^100\./ && $1 != self && $0 !~ /offline/ {print $2; exit}'
+}
+
+vpn_connected() {
+  bundle_pattern="$1"
+  scutil --nc list 2>/dev/null | grep -F "$bundle_pattern" | grep -q '(Connected)'
+}
+
+check_setting_bool() {
+  key_path="$1"
+  expected="$2"
+  actual="$(setting_raw "$key_path" 2>/dev/null || true)"
+  if [ "$actual" = "$expected" ]; then
+    pass "Karing $key_path=$actual"
+  else
+    fail "Karing $key_path=${actual:-缺失}，期望 $expected"
+  fi
+}
+
+check_tailscale_pref() {
+  prefs_file="$1"
+  key_path="$2"
+  expected="$3"
+  actual="$(json_raw "$prefs_file" "$key_path" 2>/dev/null || true)"
+  if [ "$actual" = "$expected" ]; then
+    pass "Tailscale $key_path=$actual"
+  else
+    fail "Tailscale $key_path=${actual:-缺失}，期望 $expected"
+  fi
+}
+
+doctor() {
+  require_macos
+  FAILURES=0
+  WARNINGS=0
+  say "ktnet doctor ${KTNET_VERSION}"
+  say "只读检查，不修改系统。"
+  say ""
+
+  pass "macOS $(sw_vers -productVersion) / $(uname -m)"
+
+  if [ -d "$KARING_APP" ]; then pass "已安装 Karing"; else fail "未安装 Karing"; fi
+  if [ -d "$TAILSCALE_APP" ]; then pass "已安装官方 Tailscale app"; else fail "未安装官方 Tailscale app"; fi
+
+  find_tailscale
+  if [ -n "$TAILSCALE_BIN" ]; then
+    pass "Tailscale CLI: $TAILSCALE_BIN"
+  else
+    fail "找不到 Tailscale CLI"
+  fi
+
+  if [ -f "$KARING_SETTINGS" ]; then
+    pass "找到 Karing 设置文件"
+  else
+    fail "找不到 Karing 设置文件；请先启动一次 Karing"
+  fi
+
+  if vpn_connected 'com.nebula.karing'; then pass "Karing VPN 已连接"; else fail "Karing VPN 未连接"; fi
+  if vpn_connected 'io.tailscale.ipn.macsys'; then pass "Tailscale VPN 已连接"; else fail "Tailscale VPN 未连接"; fi
+
+  if [ -n "$TAILSCALE_BIN" ]; then
+    status_file="$(tailscale_status_file 2>/dev/null || true)"
+    prefs_file="$(tailscale_prefs_file 2>/dev/null || true)"
+    if [ -n "$status_file" ]; then
+      backend="$(json_raw "$status_file" BackendState 2>/dev/null || true)"
+      online="$(json_raw "$status_file" Self.Online 2>/dev/null || true)"
+      [ "$backend" = 'Running' ] && pass "Tailscale BackendState=Running" || fail "Tailscale BackendState=${backend:-未知}"
+      [ "$online" = 'true' ] && pass "Tailscale Self.Online=true" || fail "Tailscale Self.Online=${online:-未知}"
+    else
+      fail "无法读取 Tailscale 状态"
+    fi
+    if [ -n "$prefs_file" ]; then
+      check_tailscale_pref "$prefs_file" WantRunning true
+      check_tailscale_pref "$prefs_file" CorpDNS false
+      check_tailscale_pref "$prefs_file" RouteAll false
+      check_tailscale_pref "$prefs_file" ExitNodeID ''
+      check_tailscale_pref "$prefs_file" ExitNodeIP ''
+    else
+      fail "无法读取 Tailscale 偏好"
+    fi
+  fi
+
+  if [ -f "$KARING_SETTINGS" ]; then
+    check_setting_bool tun.enable true
+    check_setting_bool tun.auto_route true
+    check_setting_bool tun.hijack_dns true
+    check_setting_bool auto_connect_after_launch true
+    check_setting_bool auto_connect_at_boot true
+    check_setting_bool private_direct true
+  fi
+
+  domain="$(detect_tailnet_domain 2>/dev/null || true)"
+  if [ -n "$domain" ] && [ -f "/etc/resolver/$domain" ]; then
+    if grep -Eq '^nameserver[[:space:]]+100\.100\.100\.100$' "/etc/resolver/$domain"; then
+      pass "MagicDNS 分流解析器: /etc/resolver/$domain"
+    else
+      fail "MagicDNS 分流解析器内容异常"
+    fi
+  elif [ -n "$domain" ]; then
+    fail "缺少 /etc/resolver/$domain"
+  else
+    warn "无法自动识别 Tailnet 域；可能尚未登录 Tailscale"
+  fi
+
+  k_if="$(karing_interface 2>/dev/null || true)"
+  t_if="$(tailscale_interface 2>/dev/null || true)"
+  public_if="$(route_interface 8.8.8.8 2>/dev/null || true)"
+  dns_if="$(route_interface 100.100.100.100 2>/dev/null || true)"
+  if [ -n "$k_if" ] && [ "$public_if" = "$k_if" ]; then
+    pass "公网路由由 Karing 接管: $public_if"
+  else
+    fail "公网路由=${public_if:-未知}，Karing 接口=${k_if:-未知}"
+  fi
+  if [ -n "$t_if" ] && [ "$dns_if" = "$t_if" ]; then
+    pass "MagicDNS 路由由 Tailscale 接管: $dns_if"
+  else
+    fail "MagicDNS 路由=${dns_if:-未知}，Tailscale 接口=${t_if:-未知}"
+  fi
+
+  if [ -n "$t_if" ]; then
+    tail6_if="$(route6_interface 'fd7a:115c:a1e0::53' 2>/dev/null || true)"
+    [ "$tail6_if" = "$t_if" ] && pass "Tailnet IPv6 路由由 Tailscale 接管" || fail "Tailnet IPv6 路由=${tail6_if:-未知}"
+  fi
+
+  if lsof -nP -iTCP:1055 -sTCP:LISTEN >/dev/null 2>&1; then
+    warn "1055 端口已被占用；本方案不需要 SOCKS5"
+  else
+    pass "1055 端口空闲，未启用 SOCKS5 备用方案"
+  fi
+
+  say ""
+  say "结果: $FAILURES 个失败，$WARNINGS 个警告"
+  [ "$FAILURES" -eq 0 ]
+}
+
+verify_once() {
+  FAILURES=0
+  WARNINGS=0
+  find_tailscale
+
+  if vpn_connected 'com.nebula.karing'; then pass "Karing VPN Connected"; else fail "Karing VPN 未连接"; fi
+  if vpn_connected 'io.tailscale.ipn.macsys'; then pass "Tailscale VPN Connected"; else fail "Tailscale VPN 未连接"; fi
+
+  if [ -z "$TAILSCALE_BIN" ]; then
+    fail "找不到 Tailscale CLI"
+  else
+    status_file="$(tailscale_status_file 2>/dev/null || true)"
+    if [ -n "$status_file" ]; then
+      backend="$(json_raw "$status_file" BackendState 2>/dev/null || true)"
+      online="$(json_raw "$status_file" Self.Online 2>/dev/null || true)"
+      [ "$backend" = Running ] && [ "$online" = true ] && pass "Tailscale Running / Online" || fail "Tailscale 状态异常: $backend / $online"
+    else
+      fail "无法读取 Tailscale 状态"
+    fi
+  fi
+
+  k_if="$(karing_interface 2>/dev/null || true)"
+  t_if="$(tailscale_interface 2>/dev/null || true)"
+  public_if="$(route_interface 8.8.8.8 2>/dev/null || true)"
+  magic_if="$(route_interface 100.100.100.100 2>/dev/null || true)"
+  [ -n "$k_if" ] && [ "$public_if" = "$k_if" ] && pass "公网 -> Karing ($k_if)" || fail "公网没有走 Karing"
+  [ -n "$t_if" ] && [ "$magic_if" = "$t_if" ] && pass "MagicDNS -> Tailscale ($t_if)" || fail "MagicDNS 没有走 Tailscale"
+
+  public_code="$(curl -L -sS -o /dev/null --max-time 15 -w '%{http_code}' https://www.apple.com 2>/dev/null || true)"
+  [ "$public_code" = 200 ] && pass "公网 HTTPS 正常 (Apple 200)" || fail "公网 HTTPS 异常 (${public_code:-无响应})"
+
+  anthropic_code="$(curl -L -sS -o /dev/null --max-time 15 -w '%{http_code}' https://api.anthropic.com 2>/dev/null || true)"
+  case "$anthropic_code" in 200|400|401|403|404) pass "Anthropic API TLS 可达 ($anthropic_code)" ;; *) fail "Anthropic API 不可达 (${anthropic_code:-无响应})" ;; esac
+
+  openai_code="$(curl -L -sS -o /dev/null --max-time 15 -w '%{http_code}' https://api.openai.com/v1/models 2>/dev/null || true)"
+  case "$openai_code" in 200|400|401|403|404) pass "OpenAI API TLS 可达 ($openai_code)" ;; *) fail "OpenAI API 不可达 (${openai_code:-无响应})" ;; esac
+
+  peer_ip="$(first_online_peer_ip 2>/dev/null || true)"
+  peer_name="$(first_online_peer_name 2>/dev/null || true)"
+  if [ -n "$peer_ip" ]; then
+    peer_if="$(route_interface "$peer_ip" 2>/dev/null || true)"
+    [ -n "$t_if" ] && [ "$peer_if" = "$t_if" ] && pass "在线设备 $peer_ip -> Tailscale" || fail "在线设备路由没有走 Tailscale"
+    if "$TAILSCALE_BIN" ping --timeout=8s "$peer_ip" >/dev/null 2>&1; then pass "tailscale ping $peer_name 成功"; else fail "tailscale ping $peer_name 失败"; fi
+  else
+    warn "当前没有在线 Tailnet 设备，跳过设备 ping"
+  fi
+
+  domain="$(detect_tailnet_domain 2>/dev/null || true)"
+  if [ -n "$peer_name" ] && [ -n "$domain" ]; then
+    if dscacheutil -q host -a name "$peer_name.$domain" 2>/dev/null | grep -q '^ip_address:'; then
+      pass "MagicDNS 解析成功: $peer_name.$domain"
+    else
+      fail "MagicDNS 解析失败: $peer_name.$domain"
+    fi
+  fi
+
+  [ "$FAILURES" -eq 0 ]
+}
+
+verify() {
+  require_macos
+  wait_seconds=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --wait)
+        [ "$#" -ge 2 ] || die "--wait 需要秒数"
+        wait_seconds="$2"
+        shift 2
+        ;;
+      *) die "verify 不认识参数: $1" ;;
+    esac
+  done
+  printf '%s' "$wait_seconds" | grep -Eq '^[0-9]+$' || die "--wait 必须是非负整数"
+  [ "$wait_seconds" -le 300 ] || die "--wait 最大为 300 秒"
+
+  say "第一轮验证 $(date '+%Y-%m-%d %H:%M:%S')"
+  if verify_once; then first_result=0; else first_result=1; fi
+  if [ "$wait_seconds" -gt 0 ]; then
+    say ""
+    info "等待 ${wait_seconds} 秒后进行第二轮验证"
+    sleep "$wait_seconds"
+    say ""
+    say "第二轮验证 $(date '+%Y-%m-%d %H:%M:%S')"
+    if verify_once; then second_result=0; else second_result=1; fi
+  else
+    second_result=0
+  fi
+  [ "$first_result" -eq 0 ] && [ "$second_result" -eq 0 ]
+}
+
+CONFIG_DOMAIN=""
+ACCEPT_ROUTES=false
+AUTO_YES=0
+DRY_RUN=0
+EXTRA_ROUTES=('')
+
+reset_config_args() {
+  CONFIG_DOMAIN=""
+  ACCEPT_ROUTES=false
+  AUTO_YES=0
+  DRY_RUN=0
+  # macOS 自带 Bash 3.2 在 set -u 下展开空数组会报 unbound variable。
+  # 保留一个空哨兵，并在消费时跳过它，以兼容系统 Bash。
+  EXTRA_ROUTES=('')
+}
+
+parse_config_args() {
+  reset_config_args
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --tailnet-domain)
+        [ "$#" -ge 2 ] || die "--tailnet-domain 缺少值"
+        CONFIG_DOMAIN="${2%.}"
+        shift 2
+        ;;
+      --extra-route)
+        [ "$#" -ge 2 ] || die "--extra-route 缺少 CIDR"
+        validate_cidr "$2" || die "CIDR 格式不安全或不正确: $2"
+        EXTRA_ROUTES+=("$2")
+        shift 2
+        ;;
+      --accept-routes) ACCEPT_ROUTES=true; shift ;;
+      --yes) AUTO_YES=1; shift ;;
+      --dry-run) DRY_RUN=1; shift ;;
+      *) die "不认识参数: $1" ;;
+    esac
+  done
+}
+
+resolve_config_domain() {
+  find_tailscale
+  if [ -z "$CONFIG_DOMAIN" ]; then
+    CONFIG_DOMAIN="$(detect_tailnet_domain 2>/dev/null || true)"
+  fi
+  [ -n "$CONFIG_DOMAIN" ] || die "无法识别 Tailnet 域；请先登录 Tailscale，或传入 --tailnet-domain"
+  validate_domain "$CONFIG_DOMAIN" || die "Tailnet 域格式不正确: $CONFIG_DOMAIN"
+}
+
+route_exists_in_list() {
+  local needle="$1"
+  local item
+  shift
+  for item in "$@"; do [ "$item" = "$needle" ] && return 0; done
+  return 1
+}
+
+build_route_list() {
+  local item
+  ROUTE_LIST=('100.64.0.0/10' 'fd7a:115c:a1e0::/48')
+  for item in "${EXTRA_ROUTES[@]}"; do
+    [ -n "$item" ] || continue
+    if ! route_exists_in_list "$item" "${ROUTE_LIST[@]}"; then ROUTE_LIST+=("$item"); fi
+  done
+}
+
+routes_json() {
+  local first=1
+  local item
+  printf '['
+  for item in "${ROUTE_LIST[@]}"; do
+    [ "$first" -eq 1 ] || printf ','
+    printf '"%s"' "$item"
+    first=0
+  done
+  printf ']'
+}
+
+show_plan() {
+  build_route_list
+  say "准备应用以下分工："
+  say "  Karing: TUN、自动路由、DNS 劫持、开机/启动后自动连接、private_direct"
+  say "  Karing 绕过: ${ROUTE_LIST[*]}"
+  say "  Tailscale: 保持当前登录，不接管公网 DNS，不使用 Exit Node，不广播路由"
+  say "  Tailscale 接受子网路由: $ACCEPT_ROUTES"
+  say "  MagicDNS: /etc/resolver/$CONFIG_DOMAIN -> 100.100.100.100"
+  say "  备份目录: $STATE_ROOT/backups/<时间戳>"
+  say "  Karing 会被正常退出并重新打开一次，期间公网可能短暂中断。"
+}
+
+plan() {
+  require_macos
+  parse_config_args "$@"
+  resolve_config_domain
+  show_plan
+}
+
+set_plist_bool() {
+  target_file="$1"
+  key_path="$2"
+  bool_value="$3"
+  if /usr/bin/plutil -extract "$key_path" raw -o /dev/null "$target_file" >/dev/null 2>&1; then
+    /usr/bin/plutil -replace "$key_path" -bool "$bool_value" "$target_file"
+  else
+    /usr/bin/plutil -insert "$key_path" -bool "$bool_value" "$target_file"
+  fi
+}
+
+set_plist_json() {
+  target_file="$1"
+  key_path="$2"
+  json_value="$3"
+  if /usr/bin/plutil -extract "$key_path" raw -o /dev/null "$target_file" >/dev/null 2>&1; then
+    /usr/bin/plutil -replace "$key_path" -json "$json_value" "$target_file"
+  else
+    /usr/bin/plutil -insert "$key_path" -json "$json_value" "$target_file"
+  fi
+}
+
+stage_karing_settings() {
+  make_runtime_dir
+  staged_file="$RUNTIME_DIR/karing_setting.json"
+  /bin/cp "$KARING_SETTINGS" "$staged_file" || return 1
+  set_plist_bool "$staged_file" tun.enable YES || return 1
+  set_plist_bool "$staged_file" tun.auto_route YES || return 1
+  set_plist_bool "$staged_file" tun.hijack_dns YES || return 1
+  set_plist_bool "$staged_file" auto_connect_after_launch YES || return 1
+  set_plist_bool "$staged_file" auto_connect_at_boot YES || return 1
+  set_plist_bool "$staged_file" private_direct YES || return 1
+  set_plist_json "$staged_file" tun.route_exclude_address "$(routes_json)" || return 1
+  /usr/bin/plutil -convert json -o /dev/null "$staged_file" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$staged_file"
+}
+
+array_csv_from_json() {
+  json_file="$1"
+  key_path="$2"
+  value_type="$(json_type "$json_file" "$key_path" 2>/dev/null || true)"
+  [ "$value_type" = array ] || { printf ''; return 0; }
+  count="$(json_raw "$json_file" "$key_path" 2>/dev/null || printf '0')"
+  printf '%s' "$count" | grep -Eq '^[0-9]+$' || count=0
+  index=0
+  first=1
+  while [ "$index" -lt "$count" ]; do
+    item="$(json_raw "$json_file" "$key_path.$index" 2>/dev/null || true)"
+    if [ -n "$item" ]; then
+      [ "$first" -eq 1 ] || printf ','
+      printf '%s' "$item"
+      first=0
+    fi
+    index=$((index + 1))
+  done
+}
+
+create_backup() {
+  require_macos
+  find_tailscale
+  [ -f "$KARING_SETTINGS" ] || die "找不到 Karing 设置文件"
+  mkdir -p "$STATE_ROOT/backups"
+  stamp="$(date '+%Y%m%d-%H%M%S')"
+  backup_dir="$STATE_ROOT/backups/$stamp"
+  mkdir -m 700 "$backup_dir" || die "无法创建备份目录"
+  /bin/cp -p "$KARING_SETTINGS" "$backup_dir/karing_setting.json" || die "备份 Karing 设置失败"
+
+  domain="$(detect_tailnet_domain 2>/dev/null || true)"
+  printf 'KTNET_BACKUP_VERSION=1\n' >"$backup_dir/manifest"
+  printf 'TAILNET_DOMAIN=%s\n' "$domain" >>"$backup_dir/manifest"
+  if [ -n "$domain" ] && [ -f "/etc/resolver/$domain" ]; then
+    /bin/cp -p "/etc/resolver/$domain" "$backup_dir/resolver.conf"
+  else
+    : >"$backup_dir/resolver.absent"
+  fi
+
+  if [ -n "$TAILSCALE_BIN" ]; then
+    prefs_source="$(tailscale_prefs_file 2>/dev/null || true)"
+    if [ -n "$prefs_source" ]; then
+      prefs_want="$(json_raw "$prefs_source" WantRunning 2>/dev/null || printf 'true')"
+      prefs_dns="$(json_raw "$prefs_source" CorpDNS 2>/dev/null || printf 'false')"
+      prefs_routes="$(json_raw "$prefs_source" RouteAll 2>/dev/null || printf 'false')"
+      prefs_exit="$(json_raw "$prefs_source" ExitNodeIP 2>/dev/null || true)"
+      prefs_advertise="$(array_csv_from_json "$prefs_source" AdvertiseRoutes)"
+      {
+        printf 'WANT_RUNNING=%s\n' "$prefs_want"
+        printf 'ACCEPT_DNS=%s\n' "$prefs_dns"
+        printf 'ACCEPT_ROUTES=%s\n' "$prefs_routes"
+        printf 'EXIT_NODE_IP=%s\n' "$prefs_exit"
+        printf 'ADVERTISE_ROUTES=%s\n' "$prefs_advertise"
+      } >"$backup_dir/tailscale-safe.env"
+    fi
+  fi
+  chmod 600 "$backup_dir"/* 2>/dev/null || true
+  LAST_BACKUP="$backup_dir"
+  printf '%s\n' "$backup_dir"
+}
+
+backup_cmd() {
+  LAST_BACKUP=""
+  create_backup
+}
+
+backups_cmd() {
+  if [ ! -d "$STATE_ROOT/backups" ]; then
+    say "还没有备份。"
+    return 0
+  fi
+  find "$STATE_ROOT/backups" -mindepth 1 -maxdepth 1 -type d -print | sort -r
+}
+
+snapshot_value() {
+  snapshot_file="$1"
+  snapshot_key="$2"
+  awk -F= -v key="$snapshot_key" '$1==key {sub(/^[^=]*=/, ""); print; exit}' "$snapshot_file"
+}
+
+quit_karing() {
+  if pgrep -x Karing >/dev/null 2>&1; then
+    /usr/bin/osascript -e 'tell application id "com.nebula.karing" to quit' >/dev/null 2>&1 || return 1
+    attempts=0
+    while pgrep -x Karing >/dev/null 2>&1 && [ "$attempts" -lt 20 ]; do
+      sleep 1
+      attempts=$((attempts + 1))
+    done
+    pgrep -x Karing >/dev/null 2>&1 && return 1
+  fi
+  return 0
+}
+
+open_apps() {
+  /usr/bin/open -gj -a Tailscale >/dev/null 2>&1 || true
+  /usr/bin/open -gj -a Karing >/dev/null 2>&1 || true
+}
+
+restore_internal() {
+  backup_dir="$1"
+  manifest="$backup_dir/manifest"
+  [ -f "$manifest" ] || die "不是有效的 ktnet 备份: 缺少 manifest"
+  [ "$(snapshot_value "$manifest" KTNET_BACKUP_VERSION)" = 1 ] || die "不支持的备份版本"
+  [ -f "$backup_dir/karing_setting.json" ] || die "备份缺少 Karing 设置"
+  domain="$(snapshot_value "$manifest" TAILNET_DOMAIN)"
+  if [ -n "$domain" ]; then validate_domain "$domain" || die "备份内 Tailnet 域无效"; fi
+
+  info "恢复 Karing 设置"
+  quit_karing || die "无法正常退出 Karing，已停止恢复"
+  /bin/cp -p "$backup_dir/karing_setting.json" "$KARING_SETTINGS" || die "恢复 Karing 设置失败"
+
+  if [ -n "$domain" ]; then
+    if [ -f "$backup_dir/resolver.conf" ]; then
+      info "恢复原 MagicDNS 解析器（需要本机管理员授权）"
+      sudo /usr/bin/install -d -m 755 /etc/resolver || die "创建 /etc/resolver 失败"
+      sudo /usr/bin/install -m 644 "$backup_dir/resolver.conf" "/etc/resolver/$domain" || die "恢复解析器失败"
+    elif [ -f "$backup_dir/resolver.absent" ]; then
+      info "删除本次新增的解析器（需要本机管理员授权）"
+      sudo /bin/rm -f "/etc/resolver/$domain" || die "删除解析器失败"
+    fi
+  fi
+
+  find_tailscale
+  if [ -n "$TAILSCALE_BIN" ] && [ -f "$backup_dir/tailscale-safe.env" ]; then
+    snapshot_file="$backup_dir/tailscale-safe.env"
+    old_dns="$(snapshot_value "$snapshot_file" ACCEPT_DNS)"
+    old_routes="$(snapshot_value "$snapshot_file" ACCEPT_ROUTES)"
+    old_exit="$(snapshot_value "$snapshot_file" EXIT_NODE_IP)"
+    old_advertise="$(snapshot_value "$snapshot_file" ADVERTISE_ROUTES)"
+    info "恢复 Tailscale 安全偏好"
+    "$TAILSCALE_BIN" set --accept-dns="$old_dns" --accept-routes="$old_routes" --exit-node="$old_exit" --advertise-routes="$old_advertise" >/dev/null || warn "Tailscale 偏好未完全恢复，请运行 doctor"
+  fi
+  open_apps
+  info "恢复完成: $backup_dir"
+}
+
+restore_cmd() {
+  require_macos
+  [ "$#" -ge 1 ] || die "restore 需要备份目录"
+  backup_dir="$1"
+  shift
+  restore_yes=0
+  while [ "$#" -gt 0 ]; do
+    case "$1" in --yes) restore_yes=1 ;; *) die "restore 不认识参数: $1" ;; esac
+    shift
+  done
+  if [ "$restore_yes" -ne 1 ]; then
+    say "将恢复: $backup_dir"
+    printf '输入 RESTORE 继续: '
+    IFS= read -r reply
+    [ "$reply" = RESTORE ] || die "已取消"
+  fi
+  restore_internal "$backup_dir"
+}
+
+preflight_configure() {
+  [ -z "${SSH_CONNECTION:-}" ] || die "检测到 SSH 会话。为避免远程断网，configure 只允许在目标 Mac 本机运行"
+  [ -d "$KARING_APP" ] || die "未安装 Karing；可运行 ktnet open-downloads"
+  [ -d "$TAILSCALE_APP" ] || die "未安装官方 Tailscale；可运行 ktnet open-downloads"
+  [ -f "$KARING_SETTINGS" ] || die "找不到 Karing 设置；请先启动 Karing 并导入自己的订阅"
+  find_tailscale
+  [ -n "$TAILSCALE_BIN" ] || die "找不到 Tailscale CLI"
+  status_file="$(tailscale_status_file)" || die "无法读取 Tailscale 状态"
+  backend="$(json_raw "$status_file" BackendState 2>/dev/null || true)"
+  online="$(json_raw "$status_file" Self.Online 2>/dev/null || true)"
+  [ "$backend" = Running ] && [ "$online" = true ] || die "请先在官方 Tailscale 中登录并连接"
+}
+
+install_resolver() {
+  make_runtime_dir
+  resolver_file="$RUNTIME_DIR/resolver.conf"
+  {
+    printf 'nameserver 100.100.100.100\n'
+    printf 'search %s\n' "$CONFIG_DOMAIN"
+    printf 'timeout 2\n'
+  } >"$resolver_file"
+  sudo /usr/bin/install -d -m 755 /etc/resolver || return 1
+  sudo /usr/bin/install -m 644 "$resolver_file" "/etc/resolver/$CONFIG_DOMAIN"
+}
+
+configure() {
+  require_macos
+  parse_config_args "$@"
+  preflight_configure
+  resolve_config_domain
+  build_route_list
+  show_plan
+  staged_file="$(stage_karing_settings)" || die "无法构建 Karing 候选设置"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    say ""
+    pass "dry-run：候选 Karing JSON 可解析"
+    say "候选绕过列表: $(/usr/bin/plutil -extract tun.route_exclude_address json -o - "$staged_file")"
+    say "没有修改任何系统设置。"
+    return 0
+  fi
+
+  if [ "$AUTO_YES" -ne 1 ]; then
+    say ""
+    printf '输入 APPLY 执行（会短暂重启 Karing）: '
+    IFS= read -r reply
+    [ "$reply" = APPLY ] || die "已取消"
+  fi
+
+  LAST_BACKUP=""
+  backup_path="$(create_backup)" || die "创建备份失败"
+  info "备份已创建: $backup_path"
+
+  info "正常退出 Karing"
+  if ! quit_karing; then
+    die "Karing 未能正常退出；没有覆盖设置，请手动退出后重试"
+  fi
+
+  if ! /bin/cp -p "$staged_file" "$KARING_SETTINGS"; then
+    open_apps
+    die "写入 Karing 设置失败"
+  fi
+
+  info "设置 Tailscale 分工"
+  if ! "$TAILSCALE_BIN" set \
+      --accept-dns=false \
+      --accept-routes="$ACCEPT_ROUTES" \
+      --exit-node= \
+      --advertise-exit-node=false \
+      --advertise-routes= >/dev/null; then
+    warn "Tailscale 设置失败，正在回退"
+    restore_internal "$backup_path"
+    exit 1
+  fi
+
+  info "安装 MagicDNS 分流解析器（macOS 会要求本机管理员授权）"
+  if ! install_resolver; then
+    warn "解析器安装失败，正在回退"
+    restore_internal "$backup_path"
+    exit 1
+  fi
+
+  open_apps
+  info "等待 Karing 与 Tailscale 恢复连接"
+  sleep 12
+  say ""
+  if verify_once; then
+    pass "配置已应用并通过即时验证"
+    say "建议继续运行: ktnet verify --wait 60"
+  else
+    warn "即时验证失败，正在自动回退"
+    restore_internal "$backup_path"
+    exit 1
+  fi
+}
+
+open_downloads() {
+  require_macos
+  info "打开官方安装页面；请在本机完成安装和账户登录"
+  /usr/bin/open 'https://tailscale.com/download/mac'
+  /usr/bin/open 'https://github.com/KaringX/karing/releases/latest'
+}
+
+main() {
+  command_name="${1:-help}"
+  if [ "$#" -gt 0 ]; then shift; fi
+  case "$command_name" in
+    help|-h|--help) usage ;;
+    version|-V|--version) say "ktnet $KTNET_VERSION" ;;
+    doctor) doctor "$@" ;;
+    plan) plan "$@" ;;
+    configure) configure "$@" ;;
+    verify) verify "$@" ;;
+    backup) backup_cmd "$@" ;;
+    backups) backups_cmd "$@" ;;
+    restore) restore_cmd "$@" ;;
+    open-downloads) open_downloads "$@" ;;
+    *) usage; die "未知命令: $command_name" ;;
+  esac
+}
+
+main "$@"
